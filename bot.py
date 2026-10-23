@@ -1,8 +1,11 @@
 import os
-import re
 import asyncio
 import logging
+import threading
 import hashlib
+
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -16,9 +19,9 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ==========================================
+# ==================================================
 # LOGGING
-# ==========================================
+# ==================================================
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -27,35 +30,67 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-# ==========================================
-# CONFIGURATION
-# ==========================================
+# ==================================================
+# ENVIRONMENT VARIABLES
+# ==================================================
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 DATABASE_NAME = os.getenv("DATABASE_NAME", "NIKDB")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 
-try:
-    ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
-except ValueError:
-    raise ValueError("ADMIN_USER_ID must be a valid Telegram user ID.")
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "0"))
+
+PORT = int(os.getenv("PORT", "10000"))
+
+CHECK_INTERVAL = 300  # 5 minutes
 
 if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("Missing TELEGRAM_BOT_TOKEN environment variable.")
+    raise ValueError("Missing TELEGRAM_BOT_TOKEN")
 
 if not DATABASE_URL:
-    raise ValueError("Missing DATABASE_URL environment variable.")
+    raise ValueError("Missing DATABASE_URL")
 
 if not CHANNEL_ID:
-    raise ValueError("Missing CHANNEL_ID environment variable.")
+    raise ValueError("Missing CHANNEL_ID")
 
 if ADMIN_USER_ID == 0:
-    raise ValueError("Set ADMIN_USER_ID in Render environment variables.")
+    raise ValueError("Missing ADMIN_USER_ID")
 
-# ==========================================
+# ==================================================
+# HTTP HEALTH CHECK
+# ==================================================
+
+class HealthHandler(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+        if self.path in ("/", "/health"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(b"OTT Notifier Bot is running")
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass
+
+
+def start_health_server():
+    server = ThreadingHTTPServer(
+        ("0.0.0.0", PORT),
+        HealthHandler,
+    )
+
+    logger.info("Health server listening on port %s", PORT)
+
+    server.serve_forever()
+
+
+# ==================================================
 # MONGODB
-# ==========================================
+# ==================================================
 
 mongo_client = MongoClient(
     DATABASE_URL,
@@ -64,17 +99,13 @@ mongo_client = MongoClient(
 
 db = mongo_client[DATABASE_NAME]
 
-subscriptions_collection = db["subscriptions"]
+subscriptions = db["subscriptions"]
 
-# ഒരേ URL ഒന്നിലധികം തവണ ചേർക്കുന്നത് തടയുന്നു.
-subscriptions_collection.create_index(
-    "url",
-    unique=True,
-)
+subscriptions.create_index("url", unique=True)
 
-# ==========================================
-# HTTP SESSION
-# ==========================================
+# ==================================================
+# HTTP REQUESTS
+# ==================================================
 
 HEADERS = {
     "User-Agent": (
@@ -84,58 +115,47 @@ HEADERS = {
     )
 }
 
-REQUEST_TIMEOUT = 20
 
-CHECK_INTERVAL = 1800  # 30 minutes
+def validate_url(url):
+    try:
+        parsed = urlparse(url)
 
+        if parsed.scheme not in ("http", "https"):
+            return False
 
-# ==========================================
-# ADMIN CHECK
-# ==========================================
+        if not parsed.hostname:
+            return False
 
-def is_admin(update: Update) -> bool:
-    user = update.effective_user
+        host = parsed.hostname.lower()
 
-    return (
-        user is not None
-        and user.id == ADMIN_USER_ID
-    )
+        allowed_domains = (
+            "zee5.com",
+            "hotstar.com",
+            "jiohotstar.com",
+            "sonyliv.com",
+            "sunnxt.com",
+        )
 
+        return any(
+            host == domain or host.endswith("." + domain)
+            for domain in allowed_domains
+        )
 
-# ==========================================
-# URL VALIDATION
-# ==========================================
-
-def validate_url(url: str) -> bool:
-    """
-    Accept only HTTP/HTTPS links.
-    """
-
-    if not url:
+    except Exception:
         return False
 
-    if len(url) > 2048:
-        return False
 
-    return url.startswith(("https://", "http://"))
-
-
-# ==========================================
-# PAGE INFORMATION
-# ==========================================
-
-def get_page_info(url: str) -> dict:
+def get_page_info(url):
     """
-    Fetch public page metadata.
+    Read publicly available page metadata.
 
-    This reads the publicly available page title and metadata.
-    It does not guarantee detection of a new episode.
+    Metadata changes are not proof of a new episode.
     """
 
     response = requests.get(
         url,
         headers=HEADERS,
-        timeout=REQUEST_TIMEOUT,
+        timeout=20,
     )
 
     response.raise_for_status()
@@ -147,7 +167,6 @@ def get_page_info(url: str) -> dict:
 
     title = None
 
-    # Open Graph title
     og_title = soup.find(
         "meta",
         attrs={"property": "og:title"},
@@ -156,17 +175,6 @@ def get_page_info(url: str) -> dict:
     if og_title:
         title = og_title.get("content")
 
-    # Twitter title
-    if not title:
-        twitter_title = soup.find(
-            "meta",
-            attrs={"name": "twitter:title"},
-        )
-
-        if twitter_title:
-            title = twitter_title.get("content")
-
-    # Normal HTML title
     if not title:
         title_tag = soup.find("title")
 
@@ -176,7 +184,6 @@ def get_page_info(url: str) -> dict:
     if not title:
         title = url
 
-    # Optional description
     description = ""
 
     og_description = soup.find(
@@ -187,40 +194,36 @@ def get_page_info(url: str) -> dict:
     if og_description:
         description = og_description.get("content", "")
 
-    # Optional poster image
-    poster = ""
-
-    og_image = soup.find(
-        "meta",
-        attrs={"property": "og:image"},
-    )
-
-    if og_image:
-        poster = og_image.get("content", "")
-
-    # Hash page metadata to detect changes.
-    content = f"{title}|{description}|{poster}"
-
-    page_hash = hashlib.sha256(
-        content.encode("utf-8")
+    # Detect changes in the available page metadata.
+    fingerprint = hashlib.sha256(
+        f"{title}|{description}".encode("utf-8")
     ).hexdigest()
 
     return {
         "title": title.strip(),
         "description": description.strip(),
-        "poster": poster.strip(),
-        "hash": page_hash,
+        "fingerprint": fingerprint,
     }
 
 
-# ==========================================
-# START COMMAND
-# ==========================================
+# ==================================================
+# ADMIN CHECK
+# ==================================================
 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+def is_admin(update):
+    user = update.effective_user
+
+    return (
+        user is not None
+        and user.id == ADMIN_USER_ID
+    )
+
+
+# ==================================================
+# START
+# ==================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not is_admin(update):
         await update.effective_message.reply_text(
@@ -230,23 +233,20 @@ async def start(
 
     await update.effective_message.reply_text(
         "🤖 OTT Notifier Bot is running!\n\n"
-        "Available commands:\n\n"
+        "Commands:\n"
         "/subscribe <OTT_LINK>\n"
         "/unsubscribe <OTT_LINK>\n"
         "/list\n"
         "/check\n\n"
-        "Monitoring interval: 30 minutes."
+        "Monitoring interval: 5 minutes."
     )
 
 
-# ==========================================
-# SUBSCRIBE COMMAND
-# ==========================================
+# ==================================================
+# SUBSCRIBE
+# ==================================================
 
-async def subscribe(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not is_admin(update):
         await update.effective_message.reply_text(
@@ -266,25 +266,39 @@ async def subscribe(
 
     if not validate_url(url):
         await update.effective_message.reply_text(
-            "❌ Invalid link. Use an HTTP or HTTPS URL."
+            "❌ Invalid or unsupported OTT link."
         )
         return
 
     try:
-        # Verify the URL before subscribing.
+        # Save the URL even if the OTT website blocks
+        # automated requests. Future checks may still fail.
         page_info = await asyncio.to_thread(
             get_page_info,
             url,
         )
 
-        subscriptions_collection.update_one(
+        title = page_info["title"]
+        fingerprint = page_info["fingerprint"]
+
+    except requests.RequestException as error:
+        logger.warning("Could not fetch %s: %s", url, error)
+
+        # Save the URL, but without claiming that
+        # the current episode state was successfully read.
+        title = url
+        fingerprint = None
+
+    try:
+        subscriptions.update_one(
             {"url": url},
             {
                 "$setOnInsert": {
                     "url": url,
                     "status": "active",
-                    "last_hash": page_info["hash"],
-                    "last_title": page_info["title"],
+                    "last_title": title,
+                    "last_fingerprint": fingerprint,
+                    "baseline_pending": fingerprint is None,
                 }
             },
             upsert=True,
@@ -292,41 +306,26 @@ async def subscribe(
 
         await update.effective_message.reply_text(
             "✅ Subscription saved!\n\n"
-            f"Page: {page_info['title']}\n"
+            f"Page: {title}\n"
             f"Link: {url}\n\n"
-            "The current page has been saved as the baseline. "
-            "Future metadata changes can be reported."
-        )
-
-    except requests.RequestException as error:
-        logger.warning(
-            "Unable to access subscription URL %s: %s",
-            url,
-            error,
-        )
-
-        await update.effective_message.reply_text(
-            "❌ Could not access this page.\n"
-            "The website may block automated requests or "
-            "require JavaScript to display its content."
+            "The bot will check this link every 5 minutes. "
+            "New-episode detection depends on the information "
+            "available from the website."
         )
 
     except PyMongoError:
-        logger.exception("MongoDB subscription error.")
+        logger.exception("MongoDB subscription error")
 
         await update.effective_message.reply_text(
-            "❌ Database error. Please try again later."
+            "❌ Database error while saving subscription."
         )
 
 
-# ==========================================
-# UNSUBSCRIBE COMMAND
-# ==========================================
+# ==================================================
+# UNSUBSCRIBE
+# ==================================================
 
-async def unsubscribe(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not is_admin(update):
         await update.effective_message.reply_text(
@@ -343,9 +342,7 @@ async def unsubscribe(
     url = context.args[0].strip()
 
     try:
-        result = subscriptions_collection.delete_one(
-            {"url": url}
-        )
+        result = subscriptions.delete_one({"url": url})
 
         if result.deleted_count:
             await update.effective_message.reply_text(
@@ -353,25 +350,22 @@ async def unsubscribe(
             )
         else:
             await update.effective_message.reply_text(
-                "ℹ️ This link was not subscribed."
+                "ℹ️ Subscription not found."
             )
 
     except PyMongoError:
-        logger.exception("MongoDB unsubscribe error.")
+        logger.exception("MongoDB unsubscribe error")
 
         await update.effective_message.reply_text(
             "❌ Database error."
         )
 
 
-# ==========================================
-# LIST COMMAND
-# ==========================================
+# ==================================================
+# LIST
+# ==================================================
 
-async def list_subscriptions(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+async def list_subscriptions(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not is_admin(update):
         await update.effective_message.reply_text(
@@ -380,28 +374,25 @@ async def list_subscriptions(
         return
 
     try:
-        subscriptions = list(
-            subscriptions_collection.find(
+        items = list(
+            subscriptions.find(
                 {"status": "active"},
                 {"url": 1, "last_title": 1, "_id": 0},
             ).limit(50)
         )
 
-        if not subscriptions:
+        if not items:
             await update.effective_message.reply_text(
                 "No active subscriptions."
             )
             return
 
-        lines = ["📺 Active OTT subscriptions:\n"]
+        lines = ["📺 Active subscriptions:\n"]
 
-        for number, sub in enumerate(
-            subscriptions,
-            start=1,
-        ):
+        for number, item in enumerate(items, 1):
             lines.append(
-                f"{number}. {sub.get('last_title', 'OTT page')}\n"
-                f"{sub['url']}"
+                f"{number}. {item.get('last_title') or 'OTT page'}\n"
+                f"{item['url']}"
             )
 
         await update.effective_message.reply_text(
@@ -409,37 +400,33 @@ async def list_subscriptions(
         )
 
     except PyMongoError:
-        logger.exception("MongoDB list error.")
+        logger.exception("MongoDB list error")
 
         await update.effective_message.reply_text(
             "❌ Could not load subscriptions."
         )
 
 
-# ==========================================
-# CHECK SUBSCRIPTIONS
-# ==========================================
+# ==================================================
+# CHECK UPDATES
+# ==================================================
 
-async def check_updates(
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+async def check_updates(context: ContextTypes.DEFAULT_TYPE):
 
     logger.info("Starting OTT metadata check.")
 
     try:
-        subscriptions = list(
-            subscriptions_collection.find(
-                {"status": "active"}
-            )
+        items = list(
+            subscriptions.find({"status": "active"})
         )
 
     except PyMongoError:
-        logger.exception("Unable to read MongoDB.")
+        logger.exception("Cannot read subscriptions from MongoDB.")
         return
 
-    for sub in subscriptions:
+    for item in items:
 
-        url = sub.get("url")
+        url = item.get("url")
 
         if not url:
             continue
@@ -450,96 +437,81 @@ async def check_updates(
                 url,
             )
 
-            previous_hash = sub.get("last_hash")
-            current_hash = page_info["hash"]
+            current_fingerprint = page_info["fingerprint"]
+            previous_fingerprint = item.get("last_fingerprint")
 
-            # First observation only establishes a baseline.
-            if not previous_hash:
-                subscriptions_collection.update_one(
-                    {"_id": sub["_id"]},
+            # If the initial page could not be read, establish
+            # a baseline now. Do not send a false alert.
+            if item.get("baseline_pending") or not previous_fingerprint:
+
+                subscriptions.update_one(
+                    {"_id": item["_id"]},
                     {
                         "$set": {
-                            "last_hash": current_hash,
+                            "last_fingerprint": current_fingerprint,
                             "last_title": page_info["title"],
+                            "baseline_pending": False,
                         }
                     },
                 )
+
+                logger.info("Baseline established for %s", url)
                 continue
 
-            # No metadata change.
-            if previous_hash == current_hash:
+            # No visible metadata change.
+            if current_fingerprint == previous_fingerprint:
                 continue
 
-            # Save the new metadata before sending the message,
-            # preventing repeated alerts for the same observation.
-            subscriptions_collection.update_one(
+            # Update stored metadata.
+            subscriptions.update_one(
                 {
-                    "_id": sub["_id"],
-                    "last_hash": previous_hash,
+                    "_id": item["_id"],
+                    "last_fingerprint": previous_fingerprint,
                 },
                 {
                     "$set": {
-                        "last_hash": current_hash,
+                        "last_fingerprint": current_fingerprint,
                         "last_title": page_info["title"],
                     }
                 },
             )
 
             message = (
-                "🔔 OTT PAGE UPDATE DETECTED\n\n"
+                "🔔 OTT PAGE CHANGE DETECTED\n\n"
                 f"🎬 Page: {page_info['title']}\n"
                 f"🔗 Link: {url}\n\n"
-                "ℹ️ The page metadata changed. "
-                "This does not necessarily mean a new episode "
-                "was released."
+                "⚠️ Page information changed. This does not "
+                "necessarily mean a new episode was released."
             )
 
             if page_info["description"]:
-                description = page_info["description"][:500]
-
                 message += (
-                    f"\n\n📝 {description}"
+                    "\n\n📝 "
+                    + page_info["description"][:500]
                 )
 
             await context.bot.send_message(
                 chat_id=CHANNEL_ID,
                 text=message,
-                disable_web_page_preview=False,
             )
 
-            logger.info(
-                "Page metadata changed: %s",
-                url,
-            )
+            logger.info("Metadata change reported for %s", url)
 
         except requests.RequestException as error:
-            logger.warning(
-                "HTTP error checking %s: %s",
-                url,
-                error,
-            )
+            logger.warning("Could not check %s: %s", url, error)
 
         except PyMongoError:
-            logger.exception(
-                "Database error checking %s",
-                url,
-            )
+            logger.exception("MongoDB error checking %s", url)
 
         except Exception:
-            logger.exception(
-                "Unexpected error checking %s",
-                url,
-            )
+            logger.exception("Unexpected error checking %s", url)
 
 
-# ==========================================
-# MANUAL CHECK COMMAND
-# ==========================================
+# ==================================================
+# MANUAL CHECK
+# ==================================================
 
-async def manual_check(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+async def manual_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not is_admin(update):
         await update.effective_message.reply_text(
@@ -554,43 +526,41 @@ async def manual_check(
     await check_updates(context)
 
     await update.effective_message.reply_text(
-        "✅ Check completed. Review the channel and Render logs "
-        "for any detected changes or errors."
+        "✅ Check completed. Check Render logs for errors."
     )
 
 
-# ==========================================
+# ==================================================
 # ERROR HANDLER
-# ==========================================
+# ==================================================
 
-async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+async def error_handler(update, context):
 
     logger.error(
-        "Telegram bot error: %s",
-        context.error,
+        "Telegram application error",
         exc_info=context.error,
     )
 
 
-# ==========================================
+# ==================================================
 # MAIN
-# ==========================================
+# ==================================================
 
-def main() -> None:
+def main():
 
-    # Verify MongoDB connectivity.
+    # Start HTTP health endpoint for Render Web Service.
+    threading.Thread(
+        target=start_health_server,
+        daemon=True,
+    ).start()
+
     try:
         mongo_client.admin.command("ping")
         logger.info("MongoDB connection successful.")
 
-    except PyMongoError as error:
-        raise RuntimeError(
-            "Could not connect to MongoDB. "
-            "Check DATABASE_URL and network access."
-        ) from error
+    except PyMongoError:
+        logger.exception("MongoDB connection failed.")
+        raise
 
     application = (
         ApplicationBuilder()
@@ -598,30 +568,14 @@ def main() -> None:
         .build()
     )
 
-    # Commands
-    application.add_handler(
-        CommandHandler("start", start)
-    )
-
-    application.add_handler(
-        CommandHandler("subscribe", subscribe)
-    )
-
-    application.add_handler(
-        CommandHandler("unsubscribe", unsubscribe)
-    )
-
-    application.add_handler(
-        CommandHandler("list", list_subscriptions)
-    )
-
-    application.add_handler(
-        CommandHandler("check", manual_check)
-    )
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("subscribe", subscribe))
+    application.add_handler(CommandHandler("unsubscribe", unsubscribe))
+    application.add_handler(CommandHandler("list", list_subscriptions))
+    application.add_handler(CommandHandler("check", manual_check))
 
     application.add_error_handler(error_handler)
 
-    # Automatic monitoring
     application.job_queue.run_repeating(
         check_updates,
         interval=CHECK_INTERVAL,
