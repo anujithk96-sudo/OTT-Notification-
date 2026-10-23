@@ -13,8 +13,8 @@ logger = logging.getLogger(__name__)
 # പ്രധാന കോൺഫിഗറേഷൻ (Render-ലെ Environment Variables-ൽ നൽകേണ്ടവ)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")  # ഡാറ്റാബേസ് യുആർഎൽ
-DATABASE_NAME = os.getenv("DATABASE_NAME", "NIKDB")  # ഡാറ്റാബേസ് പേര്
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "123456789"))  # നിങ്ങളുടെ അഡ്മിൻ ഐഡി
+DATABASE_NAME = os.getenv("DATABASE_NAME", "Cluster0")  # ഡാറ്റാബേസ് പേര്
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "1727225499"))  # നിങ്ങളുടെ അഡ്മിൻ ഐഡി
 CHANNEL_ID = os.getenv("CHANNEL_ID")  # പ്രൈവറ്റ് ചാനൽ ഐഡി അല്ലെങ്കിൽ യൂസർനെയിം
 
 # MongoDB കണക്ഷൻ
