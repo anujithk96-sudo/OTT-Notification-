@@ -3,8 +3,9 @@ import logging
 import requests
 from bs4 import BeautifulSoup
 from pymongo import MongoClient
+import telegram
 from telegram import Update
-from telegram.ext import Updater, CommandHandler, CallbackContext
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ലോഗിംഗ് സെറ്റപ്പ്
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -12,58 +13,57 @@ logger = logging.getLogger(__name__)
 
 # പ്രധാന കോൺഫിഗറേഷൻ (Render-ലെ Environment Variables-ൽ നൽകേണ്ടവ)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")  # ഡാറ്റാബേസ് യുആർഎൽ
-DATABASE_NAME = os.getenv("DATABASE_NAME", "Cluster0")  # ഡാറ്റാബേസ് പേര്
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "1727225499"))  # നിങ്ങളുടെ അഡ്മിൻ ഐഡി
-CHANNEL_ID = os.getenv("CHANNEL_ID")  # പ്രൈവറ്റ് ചാനൽ ഐഡി അല്ലെങ്കിൽ യൂസർനെയിം
+DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_NAME = os.getenv("DATABASE_NAME", "NIKDB")
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "123456789"))
+CHANNEL_ID = os.getenv("CHANNEL_ID")
 
 # MongoDB കണക്ഷൻ
 client = MongoClient(DATABASE_URL)
 db = client[DATABASE_NAME]
 subscriptions_collection = db['subscriptions']
 
-# /start കമാൻഡ് - ബോട്ട് വർക്ക് ചെയ്യുന്നുണ്ടോ എന്ന് പരിശോധിക്കാൻ
-def start(update: Update, context: CallbackContext) -> None:
-    user_id = update.message.from_user.id
+# /start കമാൻഡ്
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
     if user_id != ADMIN_USER_ID:
-        update.message.reply_text("⛔ You are not authorized.")
+        await update.message.reply_text("⛔ You are not authorized.")
         return
     
-    update.message.reply_text(
+    await update.message.reply_text(
         "🤖 **OTT Notifier Bot is Active & Running!**\n\n"
         "Use `/subscribe <OTT_LINK>` to track serials automatically.",
         parse_mode='Markdown'
     )
 
-# /subscribe കമാൻഡ് വഴി പുതിയ സീരിയൽ ലിങ്ക് ചേർക്കൽ
-def subscribe(update: Update, context: CallbackContext) -> None:
-    user_id = update.message.from_user.id
+# /subscribe കമാൻഡ്
+async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
     if user_id != ADMIN_USER_ID:
-        update.message.reply_text("⛔ You are not authorized.")
+        await update.message.reply_text("⛔ You are not authorized.")
         return
         
     if not context.args:
-        update.message.reply_text("⚠️ Please provide a link. Example:\n`/subscribe https://www.zee5.com/...`", parse_mode='Markdown')
+        await update.message.reply_text("⚠️ Please provide a link. Example:\n`/subscribe https://www.zee5.com/...`", parse_mode='Markdown')
         return
     
     url = context.args[0]
     
     existing = subscriptions_collection.find_one({"url": url})
     if existing:
-        update.message.reply_text("ℹ️ This show is already subscribed.")
+        await update.message.reply_text("ℹ️ This show is already subscribed.")
         return
 
-    # ഡാറ്റാബേസിൽ സേവ് ചെയ്യുന്നു
     subscriptions_collection.insert_one({
         "url": url,
         "status": "active",
         "last_title": ""
     })
     
-    update.message.reply_text("✅ Successfully subscribed! Monitoring started.")
+    await update.message.reply_text("✅ Successfully subscribed! Monitoring started.")
 
-# ഒടിടി വെബ്‌സൈറ്റ് ചെക്ക് ചെയ്ത് യഥാർത്ഥ സീരിയൽ പേരും ലിങ്കും ചാനലിലേക്ക് അയക്കുന്ന ഫങ്ഷൻ
-def check_updates(context: CallbackContext) -> None:
+# ഒടിടി വെബ്‌സൈറ്റ് ചെക്ക് ചെയ്ത് ചാനലിലേക്ക് അയക്കുന്ന ഫങ്ഷൻ
+async def check_updates(context: ContextTypes.DEFAULT_TYPE) -> None:
     all_subs = subscriptions_collection.find({"status": "active"})
     
     for sub in all_subs:
@@ -77,7 +77,6 @@ def check_updates(context: CallbackContext) -> None:
             if response.status_code == 200:
                 soup = BeautifulSoup(response.text, 'html.parser')
                 
-                # ഒടിടി വെബ്‌സൈറ്റിലെ യഥാർത്ഥ പേജ് ടൈറ്റിൽ ഓട്ടോമാറ്റിക്കായി എടുക്കുന്നു
                 og_title = soup.find('property', property='og:title')
                 page_title = og_title['content'] if og_title and og_title.has_attr('content') else None
                 
@@ -85,10 +84,7 @@ def check_updates(context: CallbackContext) -> None:
                     title_tag = soup.find('title')
                     page_title = title_tag.text if title_tag else "New Episode"
 
-                # പുതിയ അപ്‌ഡേറ്റ് വന്നിട്ടുണ്ടെങ്കിൽ മാത്രം അയക്കുക
                 if sub.get('last_title') != page_title:
-                    
-                    # സീരിയൽ പേര് ഓട്ടോമാറ്റിക്കായി വരുന്ന മനോഹരമായ ഫോർമാറ്റ്
                     message = f"""
 ⚡ **#First_On_OTT**
 
@@ -99,10 +95,8 @@ def check_updates(context: CallbackContext) -> None:
 🔥 *Thanks For Using OTT Notifier Bot* 🔥
                     """
                     
-                    # ചാനലിലേക്ക് നോട്ടിഫിക്കേഷൻ അയക്കുന്നു
-                    context.bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode='Markdown')
+                    await context.bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode='Markdown')
                     
-                    # ഡാറ്റാബേസ് അപ്ഡേറ്റ് ചെയ്യുന്നു
                     subscriptions_collection.update_one(
                         {"url": url},
                         {"$set": {"last_title": page_title}}
@@ -112,19 +106,17 @@ def check_updates(context: CallbackContext) -> None:
             logger.error(f"Error checking URL {url}: {e}")
 
 def main() -> None:
-    updater = Updater(TELEGRAM_BOT_TOKEN)
-    dispatcher = updater.dispatcher
+    # പുതിയ വേർഷൻ ആപ്ലിക്കേഷൻ ബിൽഡർ സെറ്റപ്പ്
+    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-    dispatcher.add_handler(CommandHandler("start", start))
-    dispatcher.add_handler(CommandHandler("subscribe", subscribe))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("subscribe", subscribe))
 
-    # Job Queue: first=5 (ബോട്ട് സ്റ്റാർട്ട് ചെയ്ത് 5 സെക്കൻഡിൽ ആദ്യ പരിശോധന)
-    # interval=1800 (പിന്നീട് ഓരോ 30 മിനിറ്റ് കൂടുമ്പോൾ ഓട്ടോമാറ്റിക്കായി ചെക്ക് ചെയ്യും)
-    job_queue = updater.job_queue
+    # Job Queue വഴി പരിശോധന ക്രമീകരിക്കുന്നു (interval: 1800 സെക്കൻഡ് = 30 മിനിറ്റ്)
+    job_queue = application.job_queue
     job_queue.run_repeating(check_updates, interval=1800, first=5)
 
-    updater.start_polling()
-    updater.idle()
+    application.run_polling()
 
 if __name__ == '__main__':
     main()
