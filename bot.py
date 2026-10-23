@@ -12,13 +12,14 @@ logger = logging.getLogger(__name__)
 
 # പ്രധാന കോൺഫിഗറേഷൻ (Render-ലെ Environment Variables-ൽ നൽകേണ്ടവ)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-MONGO_URI = os.getenv("MONGO_URI")
+DATABASE_URL = os.getenv("DATABASE_URL")  # ഡാറ്റാബേസ് യുആർഎൽ
+DATABASE_NAME = os.getenv("DATABASE_NAME", "NIKDB")  # ഡാറ്റാബേസ് പേര്
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "123456789"))  # നിങ്ങളുടെ അഡ്മിൻ ഐഡി
 CHANNEL_ID = os.getenv("CHANNEL_ID")  # പ്രൈവറ്റ് ചാനൽ ഐഡി അല്ലെങ്കിൽ യൂസർനെയിം
 
 # MongoDB കണക്ഷൻ
-client = MongoClient(MONGO_URI)
-db = client['ott_notifier_db']
+client = MongoClient(DATABASE_URL)
+db = client[DATABASE_NAME]
 subscriptions_collection = db['subscriptions']
 
 # /start കമാൻഡ് - ബോട്ട് വർക്ക് ചെയ്യുന്നുണ്ടോ എന്ന് പരിശോധിക്കാൻ
